@@ -5,10 +5,27 @@ The idea:
 - encrypt the message before hiding it
 - recover it later using a decryption key
 
-Still improving it gradually. Current build is around the “March → April update” phase.
+Still improving it gradually. Current build is around the “April → May update” phase.
 
 ---
 
+## Changelog for v1.04 
+
+Fixed issues:
+
+  - Windows 11 native file dialogs (PowerShell WinForms — reliable on all Win10/11 builds)
+  - Key copy bug fixed (tk.Text widget, no null-char, no trailing newline)
+  - Encryption/decryption runs in background thread — UI stays responsive
+  - All lambda-in-loop closure bugs fixed
+Added:
+
+  - Native OS notifications (Win32 MessageBox / notify-send / zenity / kdialog)
+  - PBKDF2-HMAC-SHA256 key derivation (100,000 iterations) — token is 16-byte salt
+  - True 2-LSB steganography — output image is *almost* same size as input
+  - Share button: image → OS share sheet / bluetooth / email / file manager
+  - Share + Save-as-txt for the decryption key token
+
+---
 ## Current Features
 
 - AES-based encryption using Fernet
@@ -61,8 +78,6 @@ Current implementation is more focused on:
 
 than perfect steganographic stealth.
 
-Right now the project uses direct pixel value embedding, not advanced LSB randomization yet. Planning to improve this in future updates.
-
 ---
 
 ## Installation
@@ -82,7 +97,7 @@ pip install opencv-python cryptography numpy pillow
 Run:
 
 ```bash
-python stego_gui_april_update_1.01.py
+python stego_gui_may_update_1.04.py
 ```
 
 ---
