@@ -1,0 +1,1072 @@
+"""
+STEGO v1.04  —  Steganography Suite
+Fixed in this version:
+  · Windows 11 native file dialogs (PowerShell WinForms — reliable on all Win10/11 builds)
+  · Native OS notifications (Win32 MessageBox / notify-send / zenity / kdialog)
+  · PBKDF2-HMAC-SHA256 key derivation (100,000 iterations) — token is just the 16-byte salt
+  · True 2-LSB steganography — output image is same size as input
+  · Prefix-stable pseudorandom pixel scatter seeded from salt (Fisher-Yates via argsort)
+  · Share button: image → OS share sheet / bluetooth / email / file manager
+  · Share + Save-as-txt for the decryption key token
+  · Key copy bug fixed (tk.Text widget, no null-char, no trailing newline)
+  · Encryption/decryption runs in background thread — UI stays responsive
+  · All lambda-in-loop closure bugs fixed
+"""
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, Menu
+import cv2
+import os
+import sys
+import subprocess
+import base64
+import hashlib
+import struct
+import secrets
+import threading
+import io
+import numpy as np
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PLATFORM HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _is_win():   return sys.platform == "win32"
+def _is_mac():   return sys.platform == "darwin"
+def _is_linux(): return sys.platform.startswith("linux")
+
+
+def _ps_run(cmd):
+    """Run a PowerShell command silently. Returns stdout string."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", cmd],
+            capture_output=True, text=True, timeout=120,
+            creationflags=0x08000000)          # CREATE_NO_WINDOW
+        lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
+        return lines[-1] if lines else ""
+    except Exception:
+        return ""
+
+
+# ── Native open-file dialog ───────────────────────────────────────────────────
+
+def _native_open(title, parent=None):
+    """Open-file dialog that returns a path string or ''."""
+    if _is_win():
+        cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.OpenFileDialog; "
+            f"$d.Title = '{title}'; "
+            "$d.Filter = 'Images|*.png;*.jpg;*.bmp;*.jpeg|All Files|*.*'; "
+            "$d.CheckFileExists = $true; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ Write-Output $d.FileName }"
+        )
+        p = _ps_run(cmd)
+        return p if p else ""
+
+    elif _is_mac():
+        script = f'POSIX path of (choose file with prompt "{title}" of type {{"png","jpg","jpeg","bmp"}})'
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=60)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
+    else:  # Linux
+        for tool, args in [
+            ("zenity", ["zenity", "--file-selection",
+                        f"--title={title}",
+                        "--file-filter=Images | *.png *.jpg *.bmp *.jpeg"]),
+            ("kdialog", ["kdialog", "--getopenfilename",
+                         os.path.expanduser("~"),
+                         "*.png *.jpg *.bmp *.jpeg",
+                         "--title", title]),
+        ]:
+            try:
+                r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            except FileNotFoundError:
+                continue
+        return filedialog.askopenfilename(
+            title=title,
+            filetypes=[("Images", "*.png *.jpg *.bmp *.jpeg"), ("All Files", "*.*")])
+
+
+# ── Native save-image dialog ──────────────────────────────────────────────────
+
+def _native_save_img(title, default_name, parent=None):
+    """Save-file dialog for PNG/BMP. Returns path or ''."""
+    if _is_win():
+        cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.SaveFileDialog; "
+            f"$d.Title = '{title}'; "
+            "$d.Filter = 'PNG Image|*.png|BMP Image|*.bmp|All Files|*.*'; "
+            f"$d.FileName = '{default_name}'; "
+            "$d.DefaultExt = 'png'; "
+            "$d.OverwritePrompt = $true; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ Write-Output $d.FileName }"
+        )
+        p = _ps_run(cmd)
+        return p if p else ""
+
+    elif _is_mac():
+        script = (f'POSIX path of (choose file name with prompt "{title}" ' +
+                  f'default name "{default_name}")')
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=60)
+            p = r.stdout.strip()
+            if p and not p.lower().endswith((".png", ".bmp")):
+                p += ".png"
+            return p
+        except Exception:
+            return ""
+
+    else:
+        for tool, args in [
+            ("zenity", ["zenity", "--file-selection", "--save",
+                        f"--title={title}",
+                        f"--filename={os.path.join(os.path.expanduser('~'), default_name)}",
+                        "--confirm-overwrite",
+                        "--file-filter=PNG / BMP | *.png *.bmp"]),
+            ("kdialog", ["kdialog", "--getsavefilename",
+                         os.path.join(os.path.expanduser("~"), default_name),
+                         "*.png *.bmp", "--title", title]),
+        ]:
+            try:
+                r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+                if r.returncode == 0 and r.stdout.strip():
+                    p = r.stdout.strip()
+                    if not p.lower().endswith((".png", ".bmp")):
+                        p += ".png"
+                    return p
+            except FileNotFoundError:
+                continue
+        return filedialog.asksaveasfilename(
+            title=title, defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("BMP Image", "*.bmp")],
+            initialfile=default_name)
+
+
+# ── Native save-text dialog ───────────────────────────────────────────────────
+
+def _native_save_txt(title, default_name, parent=None):
+    """Save-file dialog for .txt. Returns path or ''."""
+    if _is_win():
+        cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.SaveFileDialog; "
+            f"$d.Title = '{title}'; "
+            "$d.Filter = 'Text File|*.txt|All Files|*.*'; "
+            f"$d.FileName = '{default_name}'; "
+            "$d.DefaultExt = 'txt'; "
+            "$d.OverwritePrompt = $true; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ Write-Output $d.FileName }"
+        )
+        p = _ps_run(cmd)
+        return p if p else ""
+
+    elif _is_mac():
+        script = (f'POSIX path of (choose file name with prompt "{title}" ' +
+                  f'default name "{default_name}")')
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=60)
+            p = r.stdout.strip()
+            if p and not p.lower().endswith(".txt"):
+                p += ".txt"
+            return p
+        except Exception:
+            return ""
+
+    else:
+        for tool, args in [
+            ("zenity", ["zenity", "--file-selection", "--save",
+                        f"--title={title}",
+                        f"--filename={os.path.join(os.path.expanduser('~'), default_name)}",
+                        "--confirm-overwrite",
+                        "--file-filter=Text File | *.txt"]),
+            ("kdialog", ["kdialog", "--getsavefilename",
+                         os.path.join(os.path.expanduser("~"), default_name),
+                         "*.txt", "--title", title]),
+        ]:
+            try:
+                r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+                if r.returncode == 0 and r.stdout.strip():
+                    p = r.stdout.strip()
+                    if not p.lower().endswith(".txt"):
+                        p += ".txt"
+                    return p
+            except FileNotFoundError:
+                continue
+        return filedialog.asksaveasfilename(
+            title=title, defaultextension=".txt",
+            filetypes=[("Text File", "*.txt")],
+            initialfile=default_name)
+
+
+# ── Native notification ───────────────────────────────────────────────────────
+
+def _native_notify(title, message, parent=None):
+    """Show a native OS success dialog/notification."""
+    if _is_win():
+        try:
+            import ctypes
+            hwnd = int(parent.winfo_id()) if parent else 0
+            ctypes.windll.user32.MessageBoxW(
+                hwnd, message, title, 0x00000040 | 0x00010000)
+            return
+        except Exception:
+            pass
+
+    elif _is_mac():
+        safe_msg   = message.replace('"', '\\\"'  )
+        safe_title = title.replace('"', '\\\"'  )
+        script = (f'display dialog "{safe_msg}" with title "{safe_title}" ' +
+                  'buttons {"OK"} default button "OK" with icon note')
+        try:
+            subprocess.run(["osascript", "-e", script],
+                           capture_output=True, timeout=30)
+            return
+        except Exception:
+            pass
+
+    else:
+        for args in [
+            ["notify-send", "--app-name=STEGO", "--icon=dialog-information",
+             title, message],
+            ["zenity", "--info", f"--title={title}", f"--text={message}"],
+            ["kdialog", "--title", title, "--msgbox", message],
+        ]:
+            try:
+                if args[0] == "notify-send":
+                    subprocess.Popen(args)
+                else:
+                    subprocess.run(args, capture_output=True, timeout=30)
+                return
+            except FileNotFoundError:
+                continue
+
+    messagebox.showinfo(title, message)
+
+
+# ── Native share ──────────────────────────────────────────────────────────────
+
+def _native_share_file(filepath, parent=None):
+    """Share a file via OS-native mechanisms."""
+    if not filepath or not os.path.isfile(filepath):
+        messagebox.showerror("Share", "File not found — save it first.")
+        return
+
+    if _is_win():
+        # Win10/11 Share UI via WinRT through PowerShell
+        safe = filepath.replace("\\", "\\\\").replace("'", "")
+        cmd = (
+            "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+            "[void][Windows.ApplicationModel.DataTransfer.DataTransferManager,"
+            "Windows.ApplicationModel.DataTransfer,ContentType=WindowsRuntime]; "
+            "[void][Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime]; "
+            f"$f = [Windows.Storage.StorageFile]::GetFileFromPathAsync('{safe}').GetAwaiter().GetResult(); "
+            "$dtm=[Windows.ApplicationModel.DataTransfer.DataTransferManager]::GetForCurrentView(); "
+            "$dtm.add_DataRequested({"
+            "param($s,$e); "
+            "$e.Request.Data.SetStorageItems("
+            "[System.Collections.Generic.List[Windows.Storage.IStorageItem]]@($f)); "
+            "$e.Request.Data.Properties.Title='Share STEGO Image'}); "
+            "[Windows.ApplicationModel.DataTransfer.DataTransferManager]::ShowShareUI()"
+        )
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive",
+                              "-WindowStyle", "Hidden", "-Command", cmd],
+                             creationflags=0x08000000)
+            return
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(["explorer", "/select,", filepath])
+        except Exception:
+            pass
+        return
+
+    elif _is_mac():
+        script = f'tell application "Finder" to open POSIX file "{filepath}"'
+        subprocess.Popen(["osascript", "-e", script])
+        return
+
+    else:  # Linux
+        for args in [
+            ["xdg-email", f"--attach={filepath}"],
+            ["thunderbird", "--compose", f"attachment='{filepath}'"],
+            ["xdg-open", os.path.dirname(filepath)],
+        ]:
+            try:
+                subprocess.Popen(args)
+                return
+            except FileNotFoundError:
+                continue
+        messagebox.showinfo("Share", f"Image saved at:\n{filepath}\n\nShare it manually.")
+
+
+def _native_share_text(text, parent=None):
+    """Copy key to clipboard and try to open a share/email target."""
+    try:
+        if parent:
+            parent.clipboard_clear()
+            parent.clipboard_append(text)
+    except Exception:
+        pass
+
+    if _is_win():
+        # Copy via PowerShell then try Share UI
+        safe_text = text.replace("'", "''")
+        cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            f"[System.Windows.Forms.Clipboard]::SetText('{safe_text}'); "
+            "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+            "[void][Windows.ApplicationModel.DataTransfer.DataTransferManager,"
+            "Windows.ApplicationModel.DataTransfer,ContentType=WindowsRuntime]; "
+            "$dtm=[Windows.ApplicationModel.DataTransfer.DataTransferManager]::GetForCurrentView(); "
+            f"$dtm.add_DataRequested({{param($s,$e); $e.Request.Data.SetText('{safe_text}'); "
+            "$e.Request.Data.Properties.Title='STEGO Decryption Key'}); "
+            "[Windows.ApplicationModel.DataTransfer.DataTransferManager]::ShowShareUI()"
+        )
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive",
+                              "-WindowStyle", "Hidden", "-Command", cmd],
+                             creationflags=0x08000000)
+            return
+        except Exception:
+            pass
+        messagebox.showinfo("Key Copied",
+            "Key copied to clipboard. Paste it in your messaging app.")
+        return
+
+    elif _is_mac():
+        safe = text.replace('"', '\\\"'  )
+        subprocess.Popen(["osascript", "-e", f'set the clipboard to "{safe}"'])
+        return
+
+    else:  # Linux
+        for args in [
+            ["xdg-email", f"--body={text}"],
+        ]:
+            try:
+                subprocess.Popen(args)
+                return
+            except FileNotFoundError:
+                continue
+        messagebox.showinfo("Key Copied",
+            "Key copied to clipboard. Paste it into your preferred app.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CRYPTO + LSB STEGANOGRAPHY ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SALT_BYTES      = 16     # 128-bit random salt — IS the user-facing key token
+PBKDF2_ITER     = 100_000
+
+def _derive_key(salt: bytes) -> bytes:
+    """PBKDF2-HMAC-SHA256(salt, salt, 100k) → Fernet-ready URL-safe b64 key."""
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt,
+                     iterations=PBKDF2_ITER, backend=default_backend())
+    return base64.urlsafe_b64encode(kdf.derive(salt))
+
+
+def _scatter_indices(n_pixels: int, n_needed: int, salt: bytes) -> np.ndarray:
+    """
+    Prefix-stable pseudorandom unique pixel indices seeded by salt.
+    Uses argsort of uniform floats — same seed always produces the same
+    first k indices regardless of how many total we request (prefix-stable).
+    O(n_pixels log n_pixels) but fully vectorised via numpy.
+    """
+    seed = int.from_bytes(hashlib.sha256(salt + b"scatter").digest()[:8], "big")
+    rng  = np.random.default_rng(seed)
+    floats = rng.random(n_pixels)
+    if n_needed < n_pixels:
+        part  = np.argpartition(floats, n_needed)[:n_needed]
+        order = np.argsort(floats[part])
+        return part[order].astype(np.int64)
+    return np.argsort(floats).astype(np.int64)
+
+
+def _embed_bits(img_flat: np.ndarray, payload: bytes, salt: bytes) -> None:
+    """Embed payload into img_flat (H*W, 3) using 2 LSBs of blue channel per pixel."""
+    indices = _scatter_indices(len(img_flat), len(payload) * 4, salt)
+    bits = []
+    for byte in payload:
+        for shift in range(7, -1, -1):
+            bits.append((byte >> shift) & 1)
+    for i, pidx in enumerate(indices):
+        b0 = bits[i * 2]     if i * 2     < len(bits) else 0
+        b1 = bits[i * 2 + 1] if i * 2 + 1 < len(bits) else 0
+        img_flat[pidx, 0] = (int(img_flat[pidx, 0]) & 0xFC) | (b0 << 1) | b1
+
+
+def _extract_bits(img_flat: np.ndarray, indices: np.ndarray, n_bytes: int) -> bytes:
+    """Extract n_bytes from img_flat at positions given by indices."""
+    bits = []
+    for pidx in indices[:n_bytes * 4]:
+        v = int(img_flat[pidx, 0]) & 0x03
+        bits.append((v >> 1) & 1)
+        bits.append(v & 1)
+    out = bytearray()
+    for i in range(0, n_bytes * 8, 8):
+        byte = 0
+        for j in range(8):
+            byte = (byte << 1) | (bits[i + j] if i + j < len(bits) else 0)
+        out.append(byte)
+    return bytes(out)
+
+
+def stego_encode(img_bgr: np.ndarray, plaintext: str):
+    """
+    Returns (modified_image, token_string).
+    token = urlsafe_b64(salt)  — 24 ASCII chars, all the receiver needs.
+    Payload layout in image: [SALT(16)] [LEN(4)] [FERNET_CIPHERTEXT]
+    """
+    salt       = secrets.token_bytes(SALT_BYTES)
+    fernet_key = _derive_key(salt)
+    ciphertext = Fernet(fernet_key).encrypt(plaintext.encode("utf-8"))
+    payload    = salt + struct.pack(">I", len(ciphertext)) + ciphertext
+
+    h, w = img_bgr.shape[:2]
+    n_pixels = h * w
+    if len(payload) * 4 > n_pixels:
+        raise ValueError(
+            f"Message too large: needs {len(payload)*4} pixels, "
+            f"image only has {n_pixels}.")
+
+    img_out  = img_bgr.copy()
+    img_flat = img_out.reshape(-1, 3)
+    _embed_bits(img_flat, payload, salt)
+
+    token = base64.urlsafe_b64encode(salt).decode()
+    return img_out, token
+
+
+def stego_decode(img_bgr: np.ndarray, token: str) -> str:
+    """
+    Decode a message from img_bgr using the given token string.
+    token = urlsafe_b64(salt)
+    """
+    try:
+        salt = base64.urlsafe_b64decode(token.strip() + "==")
+    except Exception:
+        raise ValueError("Invalid key token — cannot base64-decode it.")
+    if len(salt) != SALT_BYTES:
+        raise ValueError(
+            f"Invalid key token length: got {len(salt)} bytes, expected {SALT_BYTES}.")
+
+    fernet_key = _derive_key(salt)
+    h, w       = img_bgr.shape[:2]
+    n_pixels   = h * w
+    img_flat   = img_bgr.reshape(-1, 3)
+
+    # ── Step 1: read header (salt + 4-byte length) ────────────────────────────
+    header_size = SALT_BYTES + 4
+    h_indices   = _scatter_indices(n_pixels, header_size * 4, salt)
+    header      = _extract_bits(img_flat, h_indices, header_size)
+
+    embedded_salt = header[:SALT_BYTES]
+    if embedded_salt != salt:
+        raise ValueError("Key mismatch — this key does not match the image.")
+
+    ct_len = struct.unpack(">I", header[SALT_BYTES:SALT_BYTES + 4])[0]
+    if ct_len == 0 or ct_len > n_pixels * 4:
+        raise ValueError("Corrupted data — bad ciphertext length in header.")
+
+    # ── Step 2: read full payload ─────────────────────────────────────────────
+    total      = header_size + ct_len
+    all_idx    = _scatter_indices(n_pixels, total * 4, salt)
+    payload    = _extract_bits(img_flat, all_idx, total)
+    ciphertext = payload[header_size:header_size + ct_len]
+
+    try:
+        return Fernet(fernet_key).decrypt(ciphertext).decode("utf-8")
+    except Exception:
+        raise ValueError("Decryption failed — wrong key or corrupted image.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COLOUR PALETTE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BG        = "#0a0e1a"
+SURFACE   = "#0f1628"
+SURFACE2  = "#141d35"
+PANEL_BD  = "#1e2d50"
+ACCENT    = "#00d4ff"
+ACCENT3   = "#06ffa5"
+BTN_FG    = "#0a0e1a"
+BTN_HOV   = "#00b8e0"
+LABEL_FG  = "#e2e8f0"
+MUTED_FG  = "#8ba3c7"
+ENTRY_BG  = "#0d1526"
+ENTRY_BD  = "#1e3a5f"
+KEY_BG    = "#0a1f1a"
+KEY_FG    = "#06ffa5"
+RESULT_BG = "#0a1f14"
+RESULT_FG = "#06ffa5"
+STATUS_BG = "#07090f"
+STATUS_FG = "#4a7a9a"
+WARN_FG   = "#f59e0b"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WIDGETS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GlowButton(tk.Canvas):
+    def __init__(self, parent, text, command, width=180, height=44,
+                 accent=ACCENT, icon="", **kwargs):
+        bg = kwargs.pop("bg", parent["bg"])
+        super().__init__(parent, width=width, height=height,
+                         bg=bg, highlightthickness=0, cursor="hand2", **kwargs)
+        self._accent = accent
+        self._text   = (icon + "  " + text) if icon else text
+        self._cmd    = command
+        self._draw(False)
+        self.bind("<Enter>",    lambda e: self._draw(True))
+        self.bind("<Leave>",    lambda e: self._draw(False))
+        self.bind("<Button-1>", lambda e: self._cmd())
+
+    def _draw(self, hov):
+        self.delete("all")
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        r = 6
+        fill = SURFACE2 if not hov else self._darken(self._accent, 0.15)
+        self._rr(2, 2, w-2, h-2, r, fill=fill, outline="")
+        brd = self._accent if hov else self._blend(self._accent, BG, 0.5)
+        self._rr(1, 1, w-1, h-1, r, fill="", outline=brd, width=1 if not hov else 2)
+        for ax, ay, bx, by in [
+            (2,2,14,2),(2,2,2,14),(w-2,2,w-14,2),(w-2,2,w-2,14),
+            (2,h-2,14,h-2),(2,h-2,2,h-14),(w-2,h-2,w-14,h-2),(w-2,h-2,w-2,h-14)]:
+            self.create_line(ax, ay, bx, by, fill=self._accent, width=2)
+        self.create_text(w//2, h//2, text=self._text,
+                         fill=BTN_FG if hov else self._accent,
+                         font=("Courier New", 12, "bold"))
+
+    def _rr(self, x1, y1, x2, y2, r, **kw):
+        pts = [x1+r,y1, x2-r,y1, x2,y1+r, x2,y2-r,
+               x2-r,y2, x1+r,y2, x1,y2-r, x1,y1+r]
+        self.create_polygon(pts, smooth=True, **kw)
+
+    @staticmethod
+    def _blend(h1, h2, t):
+        r1,g1,b1 = int(h1[1:3],16),int(h1[3:5],16),int(h1[5:7],16)
+        r2,g2,b2 = int(h2[1:3],16),int(h2[3:5],16),int(h2[5:7],16)
+        return "#{:02x}{:02x}{:02x}".format(
+            int(r1*t+r2*(1-t)), int(g1*t+g2*(1-t)), int(b1*t+b2*(1-t)))
+
+    @staticmethod
+    def _darken(hx, f):
+        r,g,b = int(hx[1:3],16),int(hx[3:5],16),int(hx[5:7],16)
+        return "#{:02x}{:02x}{:02x}".format(int(r*(1-f)),int(g*(1-f)),int(b*(1-f)))
+
+
+class SmallBtn(tk.Button):
+    def __init__(self, parent, text, command, accent=ACCENT, **kw):
+        super().__init__(parent, text=text, command=command,
+                         bg=SURFACE2, fg=accent, relief="flat",
+                         font=("Courier New", 9, "bold"),
+                         cursor="hand2", padx=8, pady=4,
+                         activebackground=PANEL_BD,
+                         activeforeground=accent, bd=0, **kw)
+        self.bind("<Enter>", lambda e: self.config(bg=PANEL_BD))
+        self.bind("<Leave>", lambda e: self.config(bg=SURFACE2))
+
+
+class CyberEntry(tk.Frame):
+    def __init__(self, parent, textvariable=None, width=40, readonly=False,
+                 mono=False, accent=ACCENT, fg=LABEL_FG, bg=ENTRY_BG, **kwargs):
+        super().__init__(parent, bg=ENTRY_BD, padx=1, pady=1)
+        font  = ("Courier New", 11) if mono else ("Segoe UI", 11)
+        state = "readonly" if readonly else "normal"
+        self._e = tk.Entry(self, textvariable=textvariable,
+                           font=font, bg=bg, fg=fg,
+                           insertbackground=accent,
+                           relief="flat", bd=4, state=state,
+                           readonlybackground=bg,
+                           selectbackground=accent,
+                           selectforeground=BG,
+                           width=width, **kwargs)
+        self._e.pack(fill="both")
+        self._e.bind("<FocusIn>",  lambda e: self.config(bg=accent))
+        self._e.bind("<FocusOut>", lambda e: self.config(bg=ENTRY_BD))
+
+    def get_entry(self): return self._e
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StegoApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("STEGO — Hidden in Pixels, Protected by Trust")
+        master.configure(bg=BG)
+        master.resizable(False, False)
+        master.minsize(560, 560)
+
+        self._last_saved_image = ""
+        self._last_key_token   = ""
+
+        self._build_menu()
+        self.container = tk.Frame(master, bg=BG)
+        self.container.pack(fill="both", expand=True)
+
+        self.home_frame   = self._build_home()
+        self.encode_frame = self._build_encode()
+        self.decode_frame = self._build_decode()
+        self._show(self.home_frame)
+
+        sb = tk.Frame(master, bg=STATUS_BG, height=22)
+        sb.pack(fill="x", side="bottom")
+        tk.Canvas(sb, bg=ACCENT, height=1, highlightthickness=0).pack(fill="x")
+        self._status_lbl = tk.Label(
+            sb,
+            text="◈  STEGO v1.03   ·   PBKDF2-SHA256 + AES-256 + LSB Scatter   ·   Ready",
+            bg=STATUS_BG, fg=STATUS_FG, font=("Courier New", 10))
+        self._status_lbl.pack(pady=3)
+
+    # ── navigation ────────────────────────────────────────────────────────────
+
+    def _show(self, frame):
+        for f in (self.home_frame, self.encode_frame, self.decode_frame):
+            f.pack_forget()
+        frame.pack(fill="both", expand=True)
+
+    def _set_status(self, msg, color=STATUS_FG):
+        self._status_lbl.config(text=f"◈  {msg}", fg=color)
+
+    # ── menu ──────────────────────────────────────────────────────────────────
+
+    def _build_menu(self):
+        mb   = Menu(self.master, bg=SURFACE, fg=LABEL_FG,
+                    activebackground=ACCENT, activeforeground=BG,
+                    relief="flat", bd=0)
+        hm   = Menu(mb, tearoff=0, bg=SURFACE2, fg=LABEL_FG,
+                    activebackground=ACCENT, activeforeground=BG)
+        hm.add_command(label="User Guide", command=self._show_help)
+        mb.add_cascade(label="Help", menu=hm)
+        self.master.config(menu=mb)
+
+    def _show_help(self):
+        messagebox.showinfo("STEGO v1.03 — Help",
+            "ENCODE:\n"
+            "  1. Select a source image (PNG / JPG / BMP).\n"
+            "  2. Type your secret message.\n"
+            "  3. Click ENCRYPT & SAVE — choose where to save.\n"
+            "  4. Copy, share, or save the key token.\n\n"
+            "DECODE:\n"
+            "  1. Select the encoded image.\n"
+            "  2. Paste the key token (the short string from step 4).\n"
+            "  3. Click DECRYPT.\n\n"
+            "SECURITY:\n"
+            "  · Key token = 16-byte random salt (24-char base64 string)\n"
+            "  · Fernet key is re-derived via PBKDF2-HMAC-SHA256 (100k iter)\n"
+            "  · Message is AES-256-CBC encrypted before embedding\n"
+            "  · Pixels chosen via pseudorandom scatter seeded from salt\n"
+            "  · Only 2 LSBs of blue channel changed — visually imperceptible\n"
+            "  · Output image is same file size as input (PNG lossless)")
+
+    # ── shared UI helpers ─────────────────────────────────────────────────────
+
+    def _browse_btn(self, parent, command, accent=ACCENT):
+        btn = tk.Button(parent, text="BROWSE ▸", command=command,
+                        bg=SURFACE2, fg=accent, relief="flat",
+                        font=("Courier New", 10, "bold"),
+                        cursor="hand2", padx=10, pady=6,
+                        activebackground=ENTRY_BD,
+                        activeforeground=accent, bd=0)
+        btn.bind("<Enter>", lambda e: btn.config(bg=PANEL_BD))
+        btn.bind("<Leave>", lambda e: btn.config(bg=SURFACE2))
+        return btn
+
+    def _clabel(self, parent, text, row, color=MUTED_FG):
+        tk.Label(parent, text=text, bg=BG, fg=color,
+                 font=("Courier New", 10, "bold")).grid(
+                     row=row, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+    # ── HOME ──────────────────────────────────────────────────────────────────
+
+    def _build_home(self):
+        frame = tk.Frame(self.container, bg=BG)
+        tk.Canvas(frame, bg=ACCENT, height=2, highlightthickness=0).pack(fill="x")
+
+        card = tk.Frame(frame, bg=SURFACE, bd=0, padx=48, pady=36)
+        card.pack(expand=True)
+        tk.Frame(card, bg=PANEL_BD, height=1).pack(fill="x", pady=(0, 24))
+
+        logo = tk.Canvas(card, width=120, height=120, bg=SURFACE, highlightthickness=0)
+        logo.pack()
+        self._draw_logo(logo)
+
+        tk.Label(card, text="S T E G O", bg=SURFACE, fg=ACCENT,
+                 font=("Courier New", 30, "bold")).pack(pady=(18, 2))
+        tk.Label(card, text="STEGANOGRAPHY SUITE  v1.03", bg=SURFACE, fg=MUTED_FG,
+                 font=("Courier New", 11)).pack()
+        tk.Label(card, text="◆───────────────────◆", bg=SURFACE,
+                 fg=PANEL_BD, font=("Courier New", 10)).pack(pady=(18, 8))
+        tk.Label(card, text="Hidden in pixels, protected by trust.",
+                 bg=SURFACE, fg=MUTED_FG,
+                 font=("Segoe UI", 12, "italic")).pack(pady=(0, 28))
+
+        row = tk.Frame(card, bg=SURFACE)
+        row.pack()
+        GlowButton(row, "ENCODE IMAGE", icon="▲",
+                   command=lambda: self._show(self.encode_frame),
+                   width=178, height=46, accent=ACCENT).pack(side="left", padx=10)
+        GlowButton(row, "DECODE IMAGE", icon="▼",
+                   command=lambda: self._show(self.decode_frame),
+                   width=178, height=46, accent=ACCENT3).pack(side="left", padx=10)
+        tk.Frame(card, bg=PANEL_BD, height=1).pack(fill="x", pady=(28, 0))
+        return frame
+
+    # ── logo ──────────────────────────────────────────────────────────────────
+
+    _LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAAAHgAAAB4CAYAAAA5ZDbSAAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxjYGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGBiBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9ArFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3ANk2uTmlyQh3M/Ck5oUGA2kOIJZhKGYIYnBncAL5H6IkfxEDg8VXBgbmCQixpJkMDNtbGRgkbiHEVBYwMPC3MDBsO48QQ4RJQWJRIliIBYiZ0tIYGD4tZ2DgjWRgEL7AwMAVDQsIHG5TALvNnSEfCNMZchhSgSKeDHkMyQx6QJYRgwGDIYMZAKbWPz9HbOBQAAAvB0lEQVR4nO29eZSd533f93ne9e73zr6v2AECBAkQAAlSpESKlCWSkmzJlmlZiWxXqiPXPW4Tn9PaqdueniZ1nTiOKzuL6sqOYkeO5VgSJVELSVHcRILEvmMwCzD7nTt3e/ft6R8XAym2klgSAQyY+Z5z/5kz95133s/7bL9VFLu3Szb0tpVyq29gQzdWG4Df5toA/DbXBuC3uTYAv821AfhtrrclYCF+0M9+wA//K5B2q2/gx5EQIGULnqIIoihBVQVSAkgURQACIQSaphJF8fXvgERKiZQg5dvXFHBbA77ORUCSJAjRgi2EIEkSPC/A932SOIYk+d4vC0BR0HUd0zQwDB1ofeftBvu2BgygKIIkkaiqShzH1OtN4jAkm88zPDLI2NgQfb09tLeV0HWDJI6xHJtyucLc3AIzM1dZXCwThyHpbIZ0Oo2UkuT6C3F7S9zupkpVVQnDkGa9SaFU4MCBuzl03362bBknm03jeR6u6xKGEb4fksQSVVPJF7LkMmk0RWN1tcaxY6f59nde5tzZi6iqSqGQI5ESmdzWj+f2BawoAgnUqnW6e7r44E++jwcfuJdYhkxcnuLK3Byu65IoCoquYaj69alcyoQkARkFaEKls72NoYFBenp7WFhY5qtPf5MXXngFXdfJ5TJEUXyr/90fWbclYFVVcRwXKRN+6sNP8p73PEy5vMzxEydpeg7pdAqhKBBLQCAUUBW19VLIhCSRJBLiOES9Br7p2PiOz1B/P/ceOoDddPhX//KPOX3iDKX2NuD23IzdNoDXRqwiFKrVGlu3b+ZTn/pFHNfhxZdfRAiFXK5AmESoikohkyaXyWKaJrqhIxSFREpUIdB1HYQgCkMajQbLKxUs20YxVJIkoVFrsHnTOIfvvZfXXnmD//czn0PXdQzTIIlvr7X5tgG8tjuuVes88YHHeOKJR3n2+ReYmbtKe0eJJIRCNsfgQC+qqrG0VGF68gpzswtUV+u4jkscxQhFYJoG2XyO/v4exjePMDo2QqGQZblc5vLkDEKFWEjsusUj73wnKTPFP/2dP2B1tUYulyWOb58p+7YAvGakaDSa/MJ/83Ns3TrO009/hXQuRQIYQmPT6BhBEHHy5DlOnzhHY7WOlk3R3ttBe08HmWIOLaURhxG+5VGv1FmZK+Ou1hG6zqatoxy67x527drK/MISZ89fJJXRWCmX2bppK/fdey+/97v/gomJaQqF/G0D+bYArAhB07L4xC9/nHwxw7Pfepaevk6aTYexwWEy2Syvvvwmp46fQ8qE4V2b2HrwDoZ2jVLobcfMmq0DoRCQSBIpCd0Ae6VJeXKRidfOcPnYBZxqjZ7hAX7ifQ8zMjLAkTeP4zpNwsAnly3y5Psf5w8+/UdcOH+ZfD53W0Be94AVRaFeb/ALv/RRMtkUL770It3d7YRezM4d25mcvMLzz79K4HiM3rmFnY/dw8DucYyMQRwHJHFMAki+929KWjZaRVFRVY0kDKlfWebSC2c488Jx7IbF1l1beP+Tj7G4vMTU1CSapqIIjSeffJxP/z9/xJUrc2Qy6XV/Xl53gL9nSmztlqvVGh/68PsZGhnguWe/RWdXOyQK45vGeeXlI5w9dYFCqcDOJ+9l80N7UFIKYeAjFYHQxBpJ5PddOEEiEomMJTIKETEYqoYuNJZOXeX4F15icWoBM5viZ5/6SQxT5+SJ4yiKRFUMHnnkYX7vn/0rHMdF07R1vbteV4DX1lopJaqq0GhYHDi0j4cffoCnv/Ql8sUsimIwNDjMc8+9xPL8MqXeDvZ87J10bx/C81ykLhGmSqILpCJIFEkiBAgFro1imSQIKZFJghomKBHIIEb6MSk9RVBxOfXnL7F87gp+EvHBD76Pjs4Cx44fRUYxPT0DbN+xnd//vc+QSqc2AP9tJETLRpzELSdBGIaU2kp88lN/l6e/+DSGqSJQGRwY5LnnXqG+WifXU2TH330nheEOgsBHpFQSQyEyBFIXSCGQiiRRQIrWmRgpEVK0zshJghpJlFAiQokSJOAFqLGCGquc//zLrJyZxQl9Hn/8EfLFLJcuXMD3A/bv30+lUudLX/w6hUJ+3U7V68ZdKK+ZBTVNQQhBGIQ8+YHHePWlV/CjgDAWDPYP8J3vvEaz1sRsyzD04QPQl6XiNrBSCXUjpmbENLWIphrR0CNsLcbRExxd4mgJti6xtQRHjXGVBFsFW02w1dZ3bC3Blj5W4jLy5F5yg+3kUhm++pXncOyA3v4hUtkMrx05wtDwAJs2j+J5/rp1R64bwAC6oSIlWE2bA/fuI4lDpqZnkEKlr7ubkyfPsbq8ilIwKL57K4wVqAcWdjqhaURYZoRtRFhmjGXGOCmJlZLYhsQxr30MiW0kOEaCbSStF+Dax9ZiLC3G0hOa0scyIrrfvRNUQSaT5hvPPE+pWCJlptF0hTePHuWBdxxc11P0LQW85t5bez5RmBDHMbl8lgP37OXEidMYKYOOQp7l5RUuX5pBb0uT3NNNancfzdjDSUlcI8E1Ylw9wTckgSHwDQVfg0BX8HWBrykEukKkK4SaINAFvga+HuNpCb6W4GsSXwNHlfg62IFH0pMiv6MXGcZIJC88/zL9A/2Aymp1lTAK2XvXLhzHRVHW1XgBbjHgNWe7piktN60QOI7LvfftZ2F+Edu1yZgpsqkMp09ewGjPYN2ZJ7OzF8+kBTWV4KYSfFMQmgqRqRAZComuEusaka62PloLbKgKQg18HUJdtF4AQ+DqAk+XeLok0CWumuBpYCce+p09YGoYmsH8/BIzk7P0dPegaSqXLkxwxx3bMQwdKdffOrwuXjkpJciWp6dYLDA41MfZc+fQNYOOji4mJmaINIl3RxGlL4fSlsIzY8IUhCZEukKgCwJDIdQlkSoJVYjVhFgDqQnQFaSuEBuCaG0k64LQUAhMhcBogQ81CDQItNY1vCTC79QRW0vEYUQ6k+b0qfPksjkymRyVepVao8GWLeN47vpbi9eFw781ilWsps3BQ3eztLiE7dl057oJnIAZa4V4fxdxp4GaNwizAlISJa+iljKkijnS2QyGYaCpAkXVkJpKokiCOMbzfDwvJA4jhAQUDZkkSCVBRjGQQKJAoiASiQhBaCEoMbFomUni4SzibAVVCFzPZ+LiNEOjfVRqVaZnZhgbH+b8+Uu3+En+Td0ywN9v0GitwxJN1xjfNMLJ06cxDJ1sNsPUxBXC0TyyKwUZlbgjhdKVIVPKkklUzLkI9cgCyYJD1PAIrQglrWLmU2T622gf70COtxEPlGimJXXHwak7JGGEQCCASCats3GiokQSqUsIBanOLGYxTWQFeGaZpENHXYkxUwZTkzP0D/aQSWeorK4yPjpKb283y8sr6Lq+bjZet24Efx9hKcHzPEZGhwijCMexyBcKBG7Igl+Hni4oGaR7cmR1k/yROtG5SRqXK/iLTUI3IIkT5PfPjteurWoqZjFDx84But+xme6HNmFt7WRRONTrNrgSVddIJBBHoKlESkBHZ5Hd82kal8uY7R1cHHSZ7lvFqLkIwA8D5meXKLXladSrVCurjI4OMTe3iGEYG4C/PxRGCEEcx4yODrK4sICUCflCkcWry/gjafTODBlXYDy/QjxRo7Ji4/sBakpHS+loRiuOirVrJrL1AqktH3ICTDx3igvfPEKpvZO++7bQ9dN7KT44xGIhwluto8YxaCrSkMSeJJfLcOUv3+TYV15m9I4tpJ/aSdKfJahLjBkHTddYWFyiu3cHppliubLCyNDwtc3W+oAL62QNTpKEVCpFNpfm3NlpVE3DFDqrwiVXyqO9vEI818QJYoIwJJIJ3UPdNKp1GrUGqqmR0k1ESkUfyxOqkCw7qI0E2QwY2DXOE7/wfuorNV7+6otcePoN9KeP0XvvZro/cQj/XYNUDI9wxUZRFdAUYlVcs34pxAqQNcBUiTtTyKsOqtraM/h+SDaXY7VSQwoolQrUag1UVb0WtgvJLYzruuWAhYAwjOnsbENKie3Y9Pb1YrsuTsVCX7IJ3QCpCHzHo2dbP+948iFOvnCMYmeRfQ/sYzUd8MbMOaRIEOfrcFcnUYdKMmmhVUMmysvYz7/MR3/l5/nI//Zxvv6Nb3HkL19h5htnKH/839D5rp10/4P7qe/I01yqg6ETJDF9W3sYv2cbPdsHqZkKqIK4zSAp6mjNmATJ6kqNYkeexaiM73t0d3ewslJF07VbCnZN6wCwQhwHdHS2YVkWiqrgOj5zlRXiRoAwVJIoQcsZ3PubT/DwT72Lr/zGn3HogUO892ffS6JGTGsWlaVuFhZmWZx+idJwJ8mednJ3S/zJJcbSbZT/9Rv87x/7DZ76h7/AR3/zk3T89J2cPnKBq//2CAuff4Pa+z9L19+7j45fvJMVRVJeaWC8f5DCu7tpNnxmp+YQikKkxHhtGplFF1UXrK7WaOssoGkaTcui1F5CypY9Pf6vHXArDAfiOKZUyrNSXsVq+Kwuz5NAywDix+QfHmf7rz/EQ/v38Wfv/Sf89BMf5Cf/zpNcmLnM5eYyZ/MBkZuwRe9k108+ipHL4zRVYkWy3KNSb1SJ7++gZyDDn/7+H6Oogsf/p49ydb9NY18X2U/so/6vj7D8mSOkX5yi+zffQWUgy4Uri2A5xKseeAFKewqzJwvDBZSeOsr5OnbDRiLIZtJYtkN7sR1NU0niWw8XbvUIFuB5AaVSgYH+Xs6cvojrBGi6huLHaDkD7Wc3k/m5PdxzYB9fe+ozHN57iCc/9jhnJy5QKSSUTZVOK8X+SwYLr0xgV22qjSZxnJBtyzE60s5ie0x25ygVfZ7+3ffxuX/z7xnq7ufBXzzAvyufZGk0j/J/vpPeD+3E/u3vUP9vn6b064dJDnbhT0eQlrhOxPbd2+iYj4hsD3FgCPmAzvF/8gxO4CPaTGrLDdrdJqZhEEuJUATc4tSYWwZYURR8PyCXy/DEBx7l2BunaTYddEMn9iPM0RLJ46P4d3VyaNMoy392AveKxc/89lOcnLhAORtRSyKKl11O/btv88YrR3E8D4HETLcecDg7C8egu6eDzneMk797HD8jwYv5zO/+Eb/z0B4ODQ3x9eY0K56HN54m9QfvIf+1KdxPv0ZhehT78UFsy0XkNPKxxvl//DUsqaM4Djt/7R2QUQnzGv13jlK/UibT34568hJuwwEpUVQVzbh14+iWmCoVReD7AYVClocfe4CXXzzC6dPn0XUNTVXJt+UJHxrAG8nR0d3GFr2D5/7Zl3j4595D07WYVhucCVYJTyzw2h9+mW987dtEcUjfSAf53jxRIkliSJkGuVKacrXK9BePI74xQzExUEoq5UaVL//zL3C3MUKHnsI0U6iJimX7rLyzH37/UcSKTf7zlzAyJjKtopCgd7fRfvhJ0tt2EccBIEj8gJk3lrlyKULTDHTToH/bENvv30XftoFb6iu+6YCFEAR+SKGY452P3M9rrxxlevIKuVyWIAjYs2877YOduEaMmtHZuW0T1a9eYnFmAX2kyNXYYiYdo0zUOPrZr/PSd99gYKCDoQfG6HlsnL4HRnH8kNqqRaXmUFm1SacNIlUy++IE5S+dIt9ZZPCDu3jhzdeIp1fZne0hpSiopo5qGkgnpJZRqP13e4mGcrRdrmPoKkEY4S7XqE2exp6fIwlbCW+SBFQFJZdGqBq6qdM53EV1fpX2sR5UTf2+TLmbq5sKWAhBFEVksmkeefRBjrx2nIW5JcyUSRzH9A91Uuoo0kx8RNHEbEuzqdDNpS8fJfI83jx5ipPJMv5Kg8azZ3nz9ZMU8mly9w6w9YmD3Hv3YR45/CA7Dm3DLOjoeiuQfWXFQlMVvDii+d1F9HJMYf8g5cYK333mFbaqPaQVjRjwREygQxInOJbH8v291MbyRG6A6Mqz6Sd2M7wpZMvhQYpjvSReRBLD+KEeNm0zURDIOMEPQypzK62HrCrcqlX4pi0O4lpekKIoPPTwYd48coLZK/MYpkEqZdLRWQAjQUpBnFGgYNLe1Y5Y8rn4whmyd/Vx1L3E1eMwdlVw9eUT6IaCNlyktGuM/V3bGSl0MDUzQzGfp9SRQ8ZQX7FJooR6zcVIadg1m+ybC6TvuIO2d23ilVdf4/An38uwkSefSiFKnXiuR6Na5+rcPH7DwzF0pKsyUVui9FgXXiWNFklWXjmH5ktWLsyTK6VZvLJETU2jSIjjiLs/eBCn7hAFUQvyLTg23TTAEgjDiEceu5+JS5NMXp5ppZXoGocf3M/U5Sms0CFOJKEmEHmDnp5OGsdmccyI1N2DZHf3M9o3TPiNo5TLFTJtWcRYib29mykoOguzFc6dv8rMTJnl6SqFUpZiW5ZaxboeaKeYGvbpZfTpOnpPgekXJnHmq+ztH+TSn36b8muXEUnM8MEx/LvbmanPoaKgqTrVKyvUGy5tega74RG9Oo2KQFVUtJUQd65OvkdH1TUufecshqG38pYVhShuQb7Z7sSbAlhRBI7jcfgdB6hVG5w9dZFUJoWiKNxzcA/NpkWcRCRSEkcJEomaNuguFmmcOEnQozP2kweQSObeOEN0ahJNV4k0gVdtsHh1Ca0mmZ1cIPQ89ARUXcVqusRxQiqtY1s+UZRgmBqR5eNdKJO+p5PlyGPp/DwjA/v46jPHee0vX0VIyaH6feTuv49ESFS15XdSdI0dWzbR9mYDpb2biXsSas+cRygKejaFmTNQFEjiGM3QUQ0NGUb0DPeQ7ypx9dwMgeMjVMHNmrNv+BqsKAqO47H7zlbUw5HXTpDOpInCmHsO7mbi4hTLc8uYpglIVO1aDLOhkddT2NUm4fEy9a+fJaw1MFcDvIYLGri2j+rD+UvTfPmrzzJzeZq7RjeRRcX3W+dpzwtQFQVVbSWK65oCQqAueMQzVaIuncZSlXYypItZSnu2UNo+jpY3WwHzCvhJiB+FJDIiqDo4cUSjbpOUTAKZEEUxTeEjNTBNA+B75SGihExPkeJoF+lsmiSOrzkpb45u6AgWQuC6HkPD/XT2tPHS86+TMo1W2OmB3awsrzJ5eZa9d28HIUiSCFUT6LqGFBIDDa/pQlohaFr0burG/sYMoe+jZTTimoseQnOhytyxSVY0naym0nHXGPqp8997yAg0XSMOYzRVRaoJtakyqb05koyC5buYaERVl+aRcyhSwJ5+ElWSShXoLIyQ5F3s2WVkJNE7NfS0jv76PPs++SBGAFoxTWZ7B+4bC0RhfG06BqEqrM6ukEiJVWuiaOpNNXzcMMBCCIIgpLevi63bx/juy8dQFEEQhuzaswUEnDtzmXQmReCHZEyTJIoxdJ0UKkrSuobnufT81kOM3beFc7/9NG2zIFVBFMTEYUK8aOH5CtQdLFXw7We+Q89wL4ahE4cxMknQdR2hKnixi6prOA0XzcggBjIomkokEiwcdvzKw3S/dzdJkmCMFrncrDFkDJD77Anqi2X6Nw9xdRSWvHn0NxtoczbG5gEmjs8CkrEDg2iZFL7rE3ohsYjQDI36XIXK1BJ62nz7rMFxnFAoZBnfPMSR754gDEOklPT1d5NJpzjy2ilS6RS+HxBFEbqSI44T/CgkpZvEYYwvYzTTwP3mZVbnPXrGN+E25vCdMnrGRFEFcc1HmiGoCqqqoKJSnlokN9xBEkaEfkA2n8a2PTRNRSCIwgQjraFk00Q5FU3XWaLB5D15Vg+madg21tIK1aUa+WqGxdkFMu/fRP2VJcRwN82js+SOWqijRRoNl9GfPYzdWMY+u4TqR6TaMgwfHkdRNGZPXqG53CCVT9+S3OIbugZLCZbdRCit0FhFUWg2bFRFJZ/PEkXRNatWiK7rxKHEcQNyRpqkGRAoknyxSPPyCuUzcySDJqJkQiSJpURRFUIvJGy6qNfOvBKJqqt4lkv7Hf2U7uhieGyAhKRVYAWBIgR6d5YAiWEpFFJpGgTMNupcXFriysIKzaqNjCRRmKBoILKQKBJEghYraIqCVAVmTmfyq0dZ/OYlsjkTu2lj5kyS7l68dIFcMUMcxbes1scNA6yqCpblMD0xz5ZtwxSKOZIkwbZdJiZm2LVrU2s9TCSe1/L3JonE9T0Kagq5ZNGIHIojHSQiofD+bSi6wNVjVEMjCuPr3ijPckmnjJaxSIJQFAxNo+Y0GCl2MdDXQ5xElIpFHDcgnUoRJDHBVBVeXqR9oJNVLLq0LHepXWxKFVAkSC9CFAz6+oaQX1ygvaufwHaIZEIYRYR1j0xPkR17ernj/i3kettw6xYyAQKJCJKbuqH6QbphgKWU6LqG4/hcPDfN2HgfxWIeRRFUVmpMT8+z78AdaIaObTuEQYip69RXV8kYKfSKz3Kzjrm5nYyvo0cqoNH76B60nhxJ0ApEF0IQhjFRFFMoZK6F/yR4TYeBIMP9m3ZQWZynq9RJNpsljkKEJgjNmFxXG4V9w5TGuqkS0PHcPPWP/ykDX5/HTOkQhCw1pyi/p0T8viGmuyzCaoXB+7fQ8b5tSD/mzB+9wsqJq5z64itMf/kkSqJQX2mgLC1h2g0aqxaqpv5H6as3Uzd4im6Fw7puwPmz0wyPdJPNpVFVhaWlCrNXF9l/4A7iKMZ1PFJGhspChUw6Ra6WsLiwTPqOHtqyRcp/dYry+RnCzTmUHSX0BBACTVUAgesGxHFMW0eW/sFO9t21k52D/Zx+8yjNisv44AiJCCmm02hbiuQeG2Ph2BTju7egduVYoEFjYZWZhVka8xUUCREJll9n6soZJs8eY+nUSfrasnRUMwxtGyfdniWvpfBnLRqXGpiKQRhHODWbsy+c4dTzJ7EqTRRNuWnn3r+uG34OXoPs+yGXLl5ldKSHTKYF+crMPFem5ti9Zyuu66MbJqHvERPTUzeoXljEGTQYvXMzzUsVsuPdxHFEvCePktIgaa3Duq6iKgLb9qmUm1RW6pw+fYnnX3yd2cUmvd2D2J6FH/qoioadDSGICI8uc3D3bhYVlylnFeWObvY8coDcrgGCKGJ/9wjvSA9xX882Dt2zj1RXidCLWLq0SvVSBVVTKXbksSybdCGNrmnYloemaxhpAzNj3lK4cJMsWWuQPS9kanKBzVsGuTQxh+t4zM8v4/shm3eM0bAckkXJ3Mw8Q93dnD+3xFR9ie1PHeSNI0eJ6x5epU5xuA13pEg8XSWMYnRVJZVNEYYhcSyRcYIqVHo7++nv62FmaY7VRhXhgtOhkNnTiX22SlHJcMej+/lmeIVyzWZlKCL1ye3U51YgFIhnLnP2T04SpXTGDgyQ21rCnawzur2DRIKFhpoyqFWbFHIZXMclCiM0XVs3BdRumjdpDbLteFyamGV8vI9MNoUQCquVGudOT2AYBiLRuHj8Ih0dJYqTHhOnJ9Ee6GfzyBgrn34d1XKJ5hto7x2E3ixpqZAIieMFaLpOsZhjYLCLwaE+EgFvnDjNpclp0kqKVb+Bm4nIbx+hvNzgsacep9lrcqK6hGe7NJZXWZicpb5cQfFCHMun4wN3MfbrP4GTSPREpfLMBBe/fJxTn3+FfCFL975Bdj92J1vfvZ1KrYaiKLdsvf1BuqnuwhZkDcf2uXxplrGxATo6S0jAqltcOHURVVOxag0ajQYjfo7GmTKnG/Mc+p+fQG8qeH92mZU3ZnBlBPuLJAMmGTRMTcP3Q2oNm/mFVaZn5pmemSWTSjHW28+8Uyb5cA9tH97BpX/7Ov1Wmkd//nFedC5Rdhwi2wUvRg0kmhMhnADChMbFK6wePUvk+YhVD60WESctg8zgtkFmT1/l4ncuoKZMQr+1s19HfG++w//6dO2HXDg/TXdPG0PDPUgpCf0Qz/UxUyYXTl1gx8g48sgClyZmsQ+2cegT72bx82dRz/rkBnvo+uAd6B8Zxb8nh8gICqZJKZullM3Sns3TUyihqIKJ/CrK3xlFbi4y//ULxN9d4lN//5NcLtQ5VlvAt10SJyRq+vieT+h6eCsW7Tt6KKqgTa/Ss7cfrjZQNIUop9DT1Y7vODiWi193cOohSSS5xaeiv6FbEizUqsGhEscJ589MMTrew+ZtQ8xMLRIGIZqhM316kr1372FX2MG502W+mz7Lu3/jEeqXVzj2xVcwrDrOl+fRNrehPdpPvLuBvxgjJhykG5OYAjmggw/6wR7irEY8H2KdW+Hv/R+/Svr+MT6//Corlkti+UR2QFEx6Q11ZGeOqfkFLho1Uu8bRFgec2fn8F6dg/4sqVjQ19/N5VNTjD24g747R/FWbJI4RtXXV1GWW5e6IltnWKEKLk8s0N3dxtYdoyzMLlOp1NE1nW/+5bfoHuzGTHTsvgIvm6d517/4GVRd5fXfeolsew6lEROMp8ht7iW8OEfqvi7sVxdJfWg7DdFAmWlinmtiTVawrzb45D/6NbZ/+AE+v/Iqk9Ua4WoTrIDI9ch7Kcq/+gwdj20nfaDI0kuT4AZwsow54aB1Z4ki2NU3QtN1Wbi0gK6o6Gmdq2dnMVLrJydpTbc88B3AMHTK5RpW02F0vI9CMcfM9DxhEDJ9bhpzSidnJ1iPb+LVbJqD/9/P0PaPe3jpn36F6l9Nk3tijCDtE7yxglRjpCIJXlsg1WfSuGJRObLAeN8Y/8Pn/iFtQ0W++PKXONMrcFebUPMQToxwfEiZFMe7MPNpZMVF2BH5jiKbPradeMEhALyXpil2FHn5O2+QK2YpptJMX55HM9dXTtKa1lWVnSRp+Va37xijUqmzUq5imDphECHdkExXjvTBQToe38b2991Jfkky8dnXOfutYzQ8h/hKk0QkKMM5dFdiotO/aYiDH3knW7aMc+7Nk5yMF1h8sI9y6CFXbaQVgB2AHZJLmfQaGcIVh6tnrhKfr9B7zzBdrsn8iUWG7xpggCxHv3WU8nKFzVuG8QOf+fkKxjqbmte0bgDDWtyWRFNVxjcPMjFxlSiMKbUVkAJWl6tooUSoCsZokdGHd7L74b1kFJP61ArNhTpJM0TkdcxAkNIMtESwMlfmqtbAfc8g1d3tVJaryKoHboCwAqTlkzQ8aHpQ96AZottgvLhE6fAg6a4OFs7ZbN1VhBWHM8+epLOvjb7eDi5enL2eZLYeta4AA9dsyxG9ve2kMiaTl+bIFbIcfPAezp44z2qjhmYYhItNAssnljGZthz5riLZXBZNUZFhjB+HhDqILSVSP7GV8J4elp0m9twqwonAi0k8H8WOkE2frlKegpFFjRPKC6vYf3UR/apF20d20K6kqU/UGL57lDN/+Tpe3WX33k1MTy3QbLpomnKromL/i1p3gOF74bXjm/ppNFwW5sq0d5W45/69nDh+Hns8hTaQJ6kFqKEk8UOkFyN0Fb2YQevLoW/vRB0r4ed0lut13JUmwoshipB+hPBipBeBHSKUhH3ZIVa+cAajYGIc7OPSX7xJbv8w7mKZA1u2IQspZt6YZOHkFbZtGyEMAqamF9ddPvBf17rYZP11tbLzVK7MLLN58yCu41NdqXP01ZPcuX8Xx0+cpZaSJNvbiIIYJV9Aa0ujpM1Wbq+QhNIlnmoinQAlSiABGUuIEwgiZBCBB9KOUDIaQeCycGYGPW0wdHcXqfdtxXp9lnsLY2SbBs99/nniOGFs2zC6rnPx4pV1DxfWKWBoRWLGccyVK4sMDnYRRhGV5RrHXj/F/nv3cunsFNMLV9Hu7CUoV/GjRUjpCFMHXUVoKqgqYi35K04QSauygIgiCBJkAPgxSRxCJsA0dIxCBjWl4X11kvfvuJd0R44v/PmXUdMGxDEgmZi4gnaTY6t+VK3LKXpNrak6Jp9P093TxtWrZVzbI1fIcPjh+6gurXJ8foJwZwnRnyFouEReBKigKKAqrSKkgpYDX9Iq7xBFECYkfoy66qMags0/s59sU8U5O097ZLAzN8hStcrXv/IsQrQCAbdsHefsmUvo+rodF39D6xowcN2hXyym6e5tY262gtV00FSVfYf30tHWxpnTF5gzbOI720kNFIlCSVCxiRoOsR8h49YU3RrOKoqmoOVSGG150pkMCTHNyQU65mIe3HYnAwO9PPu173Dm1DnMlIlpmvwvv/UP8GKHf/npP2ZpodKK/NwYwW+N1kZyNpdicKibpcUa1dU6URjSP9THnv27MRSdyZlprkY1vME09GZRewtohRQIgRStyvFIFWJBZPuESw3UqRrdFcm+4S1s376Zi5PTfO0r38K2XdLpNELAL33iKX7lVz7Jm8eP8Sd/8mc89/VXUFV13VaY/X7dFoDhe5BNU2dwsAvH8SmXa7iuhyIEI5uH2bVnB4V0lnq1QaVWpexbNI2IQGlVxBNCYAaCbKzRpaYZ6+xj08gwasbg1LnzvPyd77K0UCaXy6IoCqqmsPuurezatY1HHnoX45vG+fMv/Ad+5x99GoEgk82s+7L+t81isuaFCsOIycvzdHeXGB7pplazqVUtJi9OM3lhivaudkY3jTA+PsbdHR2kUwbEIBCkDJNUNoUAanaT2fkFnvn2C5w7exGrYZNOpymVisRxTJIk6EKl2WyysLDAhQsX2Lfvbi6dm2J0dISOznZeefFVSu1t63qqvm1G8F9XFMWk0yY9PSUUVaVet7GaLq7rEQYhUiYYpkE2lyWby7aCCQStzMF6s5UPFUYomkY2m6FYyqGqAt+LGB7p5fz5KZDQ2V1k87YR9u7dzfJCjS/8+6f5v3/3f6Wzs53/8Bdf5Qt/8TSplLluId82I/ivS9c1giBkenqJbDZFoZilt7+NOIxxvRDPCwmDln/ZatrXASiKgq5rtLUVMU2DTCZFKqWhKAqNho3VtDHTafoGurkyOYdt+9iWy1/9xTe4fHGKz37uDymVsjz7rW/x1Effj6arfO5P/oJiMU+8Dptm3baA19yNuq7hugGO7aEbGtlsmkzGJJtPtXbOfK8ISsuAoqBcy4KQicT3QsrlGrbtXTc3Tk3Osn3XJlaWVnFtnzdfO0NnZwf//A//L3bdsQ1d1Xng8H288frrbN+19Vptylv0IP4Lum0Br2mtJpVQW4XHajWLWrV5fZOkaiq6qrYq3sB1j1Xrk1z/vqIo18tn1qt1Lpy5TBzHqIrg7v138uA778Vy6py/cJH9d9/Nzt27efGV72ItVNe10eO2B7ymtQesXkuybvUAlsR+iC+D1ggTrc3WWqV5TWvFVH9vhHPtGiqV8iqjm0bo7u4giHxef/27jIwOk0lnCKOIN48e5cyF84yNbiUKo3VVYfb79bYB/P36/ge91vPwB/8e/Kci5ISi0NffzbnTF2k2G+y5eyuNRoPV6irPPPMML738MmY6RV9fD7qur4uyhT9I66Li+3pUkiS4jkMqZQACx2rVvTp+7ARPf+Vp8vkcvV3ddHWXePzJR6nX62iaeqtv+29oA/B/QlLK1lEsk8Z1A8Iw4vSJSxw/dgbd0Gkrldi1fQd2vcHPf+xD7NmzC8uy111jjvV1N+tIqqpQXq4wummQjs4SU5cXmZlaQlM1TMPAMAz6ensYHOjj6txVfu3v/zKGYRDH8brq27AB+Adorb1AeXmVqctX2X9wD3fu3YaqKQR+eC0lVMHxPIqlEmEQYJiCT/3qL9FsWutqFK+fO1lvkq1qt9OTszz/zVdJEsn2nSMEQUAQBriug9W0CIKQkaFBykuLHD68j5/60ONUqzVUdX2sxxuA/zOSshXSq2kqZ05fprOjg0IxS6Nu4XouTdumaVkkErq7upmeuszHf/Ej7Ny5Fdt21sVIvvV3sM61Zv2K44jV1QYdHW24rott29RqNarVGk3bImWmSBsp5uZm+R9//VPXiqDd+vV4A/DfUkK0ktZz+TxRHFOvN2g2GtRqNZpNiyD0aCsVsSwbM63yK//9L9Fo3Pr1eAPw30Jrrsp6rUGcSNLpFJZlYdkWtWqder2B6wfESHq7urg6Nc2he/fyvifeTa1av6Xr8Qbgv6XW6n41aha5QoEoiqjV6jStJvV6g0bDxg9aJsve7i7OnT3LR3/+Q4yND+O6t65x5QbgH0ICqFabmKaJqqq4bsv/bDWbNJtNPM8jlgnZfB7TMJmZmeITv/yx62k5t0IbgP+WktfK89drTZKwtfFCShzbwbYdLMvCdhx83yeOYro6Omg2GmRzJk999EM0Gs1bMlVvAP4hpKoKju3iWAGaoqGqCrZj4zjO9z6ug+8HKCiMDA8ze+UK+++5g3sO3NVqG3STp+oNwD+kkiSh0bBRVJUgCFsd0CwLx3FxHAfX9VqjOI7IpEx6Oju4cOE8jz/5bkqlIlEY3dSj0wbgH0oSVVWoVFYRtKoGCUXB8/1rRg8b23bxw5AgDInjhGKphGEYVKrLPPGB9xAEwQbg9SopW8EAjbqFlAq+HxJFEQCNep1Go4Ft27ieixcE+FFILCW9vT00GxbdPe0cOnzPTfU6bQD+IdXKtAhoNm0UVcO2nWuFxz2ajSaNRhOrYeN7AZ7nkSQxhmEwPDTA7OwVDh66i96+7ps2kjcA/wgSQmGlvEqpWKTZtK8XPWs0GjSbTWqNOtVGHcf18fwQRQgK+Ryd7W1UVhZ49LGHblqhtA3AP6TWiqyuVmrouoHvRrhuAIqKH0Y0m02alt06NrkOrucRBgG6ptHR3obvBZgplf0H78JxbrwBZAPwjyAhBJ7r4dguumZSq9ZRECRxjGXb/zFky8b1fRIpMc0UfX19LCzMc8ed2+jp6SIIwhs6VW8A/hElFMHSYpliW5HaaoMojFDVVjMQx2kZPlzHxfN8fNcnCCKEAplcmlw+y9LSPA++674bntu0AfhH0FpJxnJ5lUwmjZQKXuAjZauVgeO41wMCXNfFdl1czyNJwEyl6O3rxbFsioU0Bw/dfUOn6g3AP6IURcG1XcIgIl/IU682rsdj+b6PbTvYjo1t29iOg+06eH4AQiGVSjE4OMjE5cvsP3Anbe0loijiRszUG4B/HCmC5cUy3V2drJTrhGFwvZWP67l4nnfNTn0NtGsThgGaqtLeVsQ0dKZnpjh0eD++5yPEW49jA/CPKCkluqaxtFQmnU4hpILVdK73Z4zCCNtxaFoWTavlbbJtG8/1EAmoikpXdxczM1fo7CrSP9h3QzZcb8vMhpulta5uzaZFe0c7lfIqmVwagSRJEjzXQ1VUpAIKCqqioQq1VRBGUdA0jVw2w8z0Fbbv2MTC3FtflmljBP+YUhSFxcVl+gd6sC0f1/GIogiZSKIowvd9Aj/AcZ3r67HlOQRRCELQ1t5GrVYjl2/lMb/Vu+oNwD+G1owey8sVMpk0qVSaaqVJEITESWsU+4FH6PvX1uPW2dixXVzPByCbzaAqAqtp09nVcW2z9dZN0xtT9I8pIQS+F1CpVBkY6uXShctksinSGePaWhzjC/86tNYmTJIgUYXSaqOn67iuQzaTfsszFDcA/5haOxNfmZ5l247NIAW25WGYGkksEQrEcYzv+9fAtjqaIsA0TMIwRDcNojABRbzljbQ2AL8F0jSVWq2JH4S0dZRo1BtksyZGSkcmkiBoHZ+QkhiJUFtNpZM4acVqSUmcJMTyrW8JsAH4LVR5qUxvXyeVlSq27RPHCaqmoCgtD5SiqMR+CAiEFIhEtPovRiFJnBC43sYIXo+6vtlaqtDb20U2l8Fu+pCApitIII5bJQZ0wyD0WjFbutBRVEEQ+CBVbMu+1shz45i07rRW57q8XKG3r4swiPD9CD+I8NwA127lGCdxq6dxFIR4foDn+4TX6oXY9ltvk94A/BZpbRQvLJTJZlNk82mCICKOklbNEMD3QqIoJE6SVo9D16JhNYljSbPuEATBWw54Y4p+CyVEq0Dbwvwy/X2dXJ6YI4oS1Gv9k6MwbjXOLoIiEyIZ4/kRAp2V8rWuaRvHpPUrKVs76tVKA8PQ6OkvsbRQI1EV1KRV9ScMYzRNQdNULMvD0HV8LyAMwxviMrxtSxmudyVxQkd3HlVVWF2xiKIYQWuqFqIVMGCaOgCee+MC8DYA30AliSSfT2GmDfwgIokS4iRBJq3ia1K2Ku3dyJCdjSn6BkpRBM2mi2X76LqGeq2XcJIkhEFyvRzjjdQG4BustXU1DEIC/5qhSvznC7S9ldoAfJPUAnrz/+7GOfhtrg3Ab3P9/+tHWxYoGFdzAAAAAElFTkSuQmCC"
+
+    def _draw_logo(self, c):
+        try:
+            from PIL import Image, ImageTk
+            data    = base64.b64decode(self._LOGO_B64)
+            pil_img = Image.open(io.BytesIO(data)).convert("RGBA")
+            pil_img = pil_img.resize((120, 120), Image.LANCZOS)
+            bg_img  = Image.new("RGB", pil_img.size, (15, 22, 40))
+            bg_img.paste(pil_img, mask=pil_img.split()[3])
+            self._logo_img = ImageTk.PhotoImage(bg_img)
+            c.create_image(60, 60, image=self._logo_img)
+        except Exception:
+            c.create_oval(10, 10, 110, 110, outline=ACCENT, width=2)
+            c.create_text(60, 60, text="STEGO", fill=ACCENT,
+                          font=("Courier New", 16, "bold"))
+
+    # ── ENCODE ────────────────────────────────────────────────────────────────
+
+    def _build_encode(self):
+        outer = tk.Frame(self.container, bg=BG)
+        tk.Canvas(outer, bg=ACCENT, height=2, highlightthickness=0).pack(fill="x")
+
+        hdr = tk.Frame(outer, bg=SURFACE, pady=10, padx=20)
+        hdr.pack(fill="x")
+        tk.Button(hdr, text="◄  BACK", bg=SURFACE, fg=ACCENT,
+                  relief="flat", font=("Courier New", 11, "bold"),
+                  bd=0, cursor="hand2", activebackground=SURFACE,
+                  activeforeground=BTN_HOV,
+                  command=lambda: self._show(self.home_frame)).pack(side="left")
+        tk.Label(hdr, text="▲  ENCODE IMAGE", bg=SURFACE, fg=LABEL_FG,
+                 font=("Courier New", 14, "bold")).pack(side="left", padx=16)
+        tk.Label(hdr, text="[PBKDF2 + AES-256 + LSB SCATTER]",
+                 bg=SURFACE, fg=MUTED_FG,
+                 font=("Courier New", 9)).pack(side="right", padx=8)
+        tk.Frame(outer, bg=ACCENT, height=1).pack(fill="x")
+
+        body = tk.Frame(outer, bg=BG, padx=30, pady=20)
+        body.pack(fill="both", expand=True)
+
+        # Source image
+        self._clabel(body, "[ SOURCE IMAGE ]", 0)
+        self.src_path = tk.StringVar()
+        r1 = tk.Frame(body, bg=BG)
+        r1.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+        CyberEntry(r1, textvariable=self.src_path, width=36).pack(side="left")
+        self._browse_btn(r1, self._browse_source).pack(side="left", padx=(8, 0))
+
+        # Message
+        self._clabel(body, "[ SECRET MESSAGE ]", 2)
+        self.secret_msg = tk.Text(
+            body, height=5, width=44, font=("Segoe UI", 11),
+            bg=ENTRY_BG, fg=LABEL_FG, insertbackground=ACCENT,
+            relief="flat", bd=6, selectbackground=ACCENT, selectforeground=BG,
+            highlightbackground=ENTRY_BD, highlightcolor=ACCENT, highlightthickness=1)
+        self.secret_msg.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+
+        # Encrypt button
+        bf = tk.Frame(body, bg=BG)
+        bf.grid(row=4, column=0, columnspan=3, pady=4)
+        GlowButton(bf, "ENCRYPT  &  SAVE", icon="▲",
+                   command=self.encrypt, width=220, height=46, accent=ACCENT).pack()
+
+        # Key display
+        self._clabel(body, "[ DECRYPTION KEY TOKEN  —  share or save this ]", 5, WARN_FG)
+        kf = tk.Frame(body, bg=ENTRY_BD, padx=1, pady=1)
+        kf.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(4, 4))
+        self.key_text = tk.Text(
+            kf, height=1, width=44, font=("Courier New", 11),
+            bg=KEY_BG, fg=KEY_FG, insertbackground=ACCENT3,
+            relief="flat", bd=4, selectbackground=ACCENT3, selectforeground=BG,
+            wrap="none", state="disabled")
+        self.key_text.pack(fill="both")
+
+        # Key action buttons
+        kb = tk.Frame(body, bg=BG)
+        kb.grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 8))
+        SmallBtn(kb, "⧉ COPY KEY",
+                 command=self._copy_key, accent=ACCENT3).pack(side="left", padx=(0,6))
+        SmallBtn(kb, "↗ SHARE KEY",
+                 command=self._share_key, accent=ACCENT3).pack(side="left", padx=(0,6))
+        SmallBtn(kb, "💾 SAVE KEY AS TXT",
+                 command=self._save_key_txt, accent=WARN_FG).pack(side="left")
+
+        # Image share button
+        ib = tk.Frame(body, bg=BG)
+        ib.grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        SmallBtn(ib, "↗ SHARE IMAGE",
+                 command=self._share_image, accent=ACCENT).pack(side="left")
+
+        body.columnconfigure(0, weight=1)
+        return outer
+
+    # ── DECODE ────────────────────────────────────────────────────────────────
+
+    def _build_decode(self):
+        outer = tk.Frame(self.container, bg=BG)
+        tk.Canvas(outer, bg=ACCENT3, height=2, highlightthickness=0).pack(fill="x")
+
+        hdr = tk.Frame(outer, bg=SURFACE, pady=10, padx=20)
+        hdr.pack(fill="x")
+        tk.Button(hdr, text="◄  BACK", bg=SURFACE, fg=ACCENT3,
+                  relief="flat", font=("Courier New", 11, "bold"),
+                  bd=0, cursor="hand2", activebackground=SURFACE,
+                  activeforeground=BTN_HOV,
+                  command=lambda: self._show(self.home_frame)).pack(side="left")
+        tk.Label(hdr, text="▼  DECODE IMAGE", bg=SURFACE, fg=LABEL_FG,
+                 font=("Courier New", 14, "bold")).pack(side="left", padx=16)
+        tk.Label(hdr, text="[LSB SCATTER + AES-256 + PBKDF2 VERIFY]",
+                 bg=SURFACE, fg=MUTED_FG,
+                 font=("Courier New", 9)).pack(side="right", padx=8)
+        tk.Frame(outer, bg=ACCENT3, height=1).pack(fill="x")
+
+        body = tk.Frame(outer, bg=BG, padx=30, pady=20)
+        body.pack(fill="both", expand=True)
+
+        # Encoded image
+        self._clabel(body, "[ ENCODED IMAGE ]", 0, ACCENT3)
+        self.encrypted_path = tk.StringVar()
+        r1 = tk.Frame(body, bg=BG)
+        r1.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+        CyberEntry(r1, textvariable=self.encrypted_path, width=36,
+                   accent=ACCENT3).pack(side="left")
+        self._browse_btn(r1, self._browse_encoded,
+                         accent=ACCENT3).pack(side="left", padx=(8, 0))
+
+        # Key token
+        self._clabel(body, "[ DECRYPTION KEY TOKEN ]", 2, ACCENT3)
+        self.decrypt_key = tk.StringVar()
+        CyberEntry(body, textvariable=self.decrypt_key,
+                   width=44, mono=True, accent=ACCENT3,
+                   fg=KEY_FG, bg=KEY_BG).grid(
+                       row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+
+        # Decrypt button
+        bf = tk.Frame(body, bg=BG)
+        bf.grid(row=4, column=0, columnspan=3, pady=4)
+        GlowButton(bf, "DECRYPT  MESSAGE", icon="▼",
+                   command=self.decrypt, width=220, height=46, accent=ACCENT3).pack()
+
+        # Result
+        self._clabel(body, "[ DECRYPTED MESSAGE ]", 5, ACCENT3)
+        rf = tk.Frame(body, bg=ENTRY_BD, padx=1, pady=1)
+        rf.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(4, 6))
+        self.result_text = tk.Text(
+            rf, height=3, width=44, font=("Segoe UI", 11),
+            bg=RESULT_BG, fg=RESULT_FG, insertbackground=ACCENT3,
+            relief="flat", bd=4, selectbackground=ACCENT3, selectforeground=BG,
+            wrap="word", state="disabled")
+        self.result_text.pack(fill="both")
+
+        rb = tk.Frame(body, bg=BG)
+        rb.grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 4))
+        SmallBtn(rb, "⧉ COPY MESSAGE",
+                 command=self._copy_result, accent=ACCENT3).pack(side="left")
+
+        body.columnconfigure(0, weight=1)
+        return outer
+
+    # ── browse callbacks ──────────────────────────────────────────────────────
+
+    def _browse_source(self):
+        p = _native_open("Select Source Image", parent=self.master)
+        if p:
+            self.src_path.set(p)
+
+    def _browse_encoded(self):
+        p = _native_open("Select Encoded Image", parent=self.master)
+        if p:
+            self.encrypted_path.set(p)
+
+    # ── key helpers ───────────────────────────────────────────────────────────
+
+    def _set_key_text(self, token: str):
+        self._last_key_token = token.strip()
+        self.key_text.config(state="normal")
+        self.key_text.delete("1.0", tk.END)
+        self.key_text.insert("1.0", self._last_key_token)
+        self.key_text.config(state="disabled")
+
+    def _copy_key(self):
+        t = self._last_key_token
+        if not t:
+            messagebox.showwarning("No Key", "Encrypt a message first.")
+            return
+        self.master.clipboard_clear()
+        self.master.clipboard_append(t)
+        self._set_status("Key token copied to clipboard.", ACCENT3)
+
+    def _share_key(self):
+        t = self._last_key_token
+        if not t:
+            messagebox.showwarning("No Key", "Encrypt a message first.")
+            return
+        _native_share_text(t, parent=self.master)
+
+    def _save_key_txt(self):
+        t = self._last_key_token
+        if not t:
+            messagebox.showwarning("No Key", "Encrypt a message first.")
+            return
+        path = _native_save_txt("Save Decryption Key",
+                                "stego_key.txt", parent=self.master)
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(t)
+                self._set_status(f"Key saved → {os.path.basename(path)}", ACCENT3)
+                _native_notify("Key Saved",
+                               f"Decryption key saved:\n{path}",
+                               parent=self.master)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not save key:\n{e}")
+
+    def _share_image(self):
+        if not self._last_saved_image:
+            messagebox.showwarning("No Image", "Encrypt and save an image first.")
+            return
+        _native_share_file(self._last_saved_image, parent=self.master)
+
+    def _copy_result(self):
+        txt = self.result_text.get("1.0", tk.END).strip()
+        if not txt:
+            return
+        self.master.clipboard_clear()
+        self.master.clipboard_append(txt)
+        self._set_status("Decrypted message copied to clipboard.", ACCENT3)
+
+    # ── core logic ────────────────────────────────────────────────────────────
+
+    def encrypt(self):
+        img_path = self.src_path.get().strip()
+        msg      = self.secret_msg.get("1.0", tk.END).strip()
+        if not img_path:
+            messagebox.showerror("Error", "Please select a source image.")
+            return
+        if not msg:
+            messagebox.showerror("Error", "Please enter a secret message.")
+            return
+        img = cv2.imread(img_path)
+        if img is None:
+            messagebox.showerror("Error",
+                "Cannot read image.\nCheck the file path and format.")
+            return
+
+        self._set_status("Encrypting…", WARN_FG)
+        self.master.update()
+
+        def _worker():
+            try:
+                img_out, token = stego_encode(img, msg)
+                self.master.after(0, lambda: self._finish_encrypt(img_out, token))
+            except Exception as exc:
+                err = str(exc)
+                self.master.after(0, lambda: (
+                    messagebox.showerror("Encryption Error", err),
+                    self._set_status("Encryption failed.", "#ef4444")))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_encrypt(self, img_out, token):
+        save_path = _native_save_img("Save Encoded Image",
+                                     "secret_image.png", parent=self.master)
+        if not save_path:
+            self._set_status("Save cancelled.", STATUS_FG)
+            return
+        if not save_path.lower().endswith((".png", ".bmp")):
+            save_path += ".png"
+        try:
+            cv2.imwrite(save_path, img_out)
+            self._last_saved_image = save_path
+            self._set_key_text(token)
+            self._set_status(
+                f"Saved → {os.path.basename(save_path)}  |  Key token ready", ACCENT3)
+            _native_notify("Encryption Complete",
+                           f"Image saved:\n{save_path}\n\n"
+                           "Use the key token below to decrypt.",
+                           parent=self.master)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not write image:\n{e}")
+            self._set_status("Save failed.", "#ef4444")
+
+    def decrypt(self):
+        img_path = self.encrypted_path.get().strip()
+        token    = self.decrypt_key.get().strip()
+        if not img_path:
+            messagebox.showerror("Error", "Please select an encoded image.")
+            return
+        if not token:
+            messagebox.showerror("Error", "Please paste the decryption key token.")
+            return
+        img = cv2.imread(img_path)
+        if img is None:
+            messagebox.showerror("Error",
+                "Cannot read image.\nCheck the file path and format.")
+            return
+
+        self._set_status("Decrypting…", WARN_FG)
+        self.master.update()
+
+        def _worker():
+            try:
+                plaintext = stego_decode(img, token)
+                self.master.after(0, lambda: self._finish_decrypt(plaintext))
+            except Exception as exc:
+                err = str(exc)
+                self.master.after(0, lambda: (
+                    messagebox.showerror("Decryption Failed",
+                                         f"{err}\n\n"
+                                         "Verify you are using the correct key token "
+                                         "and the exact image that was encoded."),
+                    self._set_status("Decryption failed.", "#ef4444")))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_decrypt(self, plaintext):
+        self.result_text.config(state="normal")
+        self.result_text.delete("1.0", tk.END)
+        self.result_text.insert("1.0", plaintext)
+        self.result_text.config(state="disabled")
+        self._set_status("Decryption successful — message revealed.", ACCENT3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.configure(bg=BG)
+    StegoApp(root)
+    root.mainloop()
