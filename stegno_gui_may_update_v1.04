@@ -1,17 +1,3 @@
-"""
-STEGO v1.04  —  Steganography Suite
-Fixed in this version:
-  · Windows 11 native file dialogs (PowerShell WinForms — reliable on all Win10/11 builds)
-  · Native OS notifications (Win32 MessageBox / notify-send / zenity / kdialog)
-  · PBKDF2-HMAC-SHA256 key derivation (100,000 iterations) — token is just the 16-byte salt
-  · True 2-LSB steganography — output image is same size as input
-  · Prefix-stable pseudorandom pixel scatter seeded from salt (Fisher-Yates via argsort)
-  · Share button: image → OS share sheet / bluetooth / email / file manager
-  · Share + Save-as-txt for the decryption key token
-  · Key copy bug fixed (tk.Text widget, no null-char, no trailing newline)
-  · Encryption/decryption runs in background thread — UI stays responsive
-  · All lambda-in-loop closure bugs fixed
-"""
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, Menu
