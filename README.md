@@ -9,7 +9,7 @@ Still improving it gradually. Current build is around the “May → June update
 
 ---
 
-## Changelog for v1.05 
+## Changelog for v1.051 
 
 Fixed issues:
 
@@ -97,7 +97,7 @@ pip install opencv-python cryptography numpy pillow
 Run:
 
 ```bash
-python stego_gui_june_update_1.05.py
+python stego_v1.051.py
 ```
 
 ---
