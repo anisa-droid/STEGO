@@ -1,11 +1,8 @@
-# Stego: A Secure and Adaptive Image Steganography System
+# STEGO
 
-The idea:
-- hide secret messages inside images
-- encrypt the message before hiding it
-- recover it later using a decryption key
+STEGO is a secure image steganography application developed to combine modern cryptography with digital steganography. The application encrypts confidential messages using AES-based encryption and PBKDF2-HMAC-SHA256 key derivation before concealing the ciphertext inside images through pseudorandom 2-LSB embedding.
 
-Still improving it gradually. Current build is around the “May → June update” phase.
+Designed with security, usability, and portability in mind, STEGO provides a modern cross-platform desktop interface for securely hiding and retrieving information without visibly altering the carrier image.
 
 ---
 
