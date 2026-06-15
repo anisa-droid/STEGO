@@ -20,7 +20,6 @@ from cryptography.hazmat.backends import default_backend
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PLATFORM HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _is_win():   return sys.platform == "win32"
 def _is_mac():   return sys.platform == "darwin"
