@@ -40,7 +40,7 @@ def _ps_run(cmd):
         return ""
 
 
-# ── Native open-file dialog ───────────────────────────────────────────────────
+#  Native open-file dialog 
 
 def _native_open(title, parent=None):
     """Open-file dialog that returns a path string or ''."""
