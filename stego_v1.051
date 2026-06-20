@@ -203,7 +203,7 @@ def _native_save_txt(title, default_name, parent=None):
             initialfile=default_name)
 
 
-# ── Native notification ───────────────────────────────────────────────────────
+# ── Native notification
 
 def _native_notify(title, message, parent=None):
     """Show a native OS success dialog/notification."""
