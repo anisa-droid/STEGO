@@ -87,7 +87,7 @@ def _native_open(title, parent=None):
             filetypes=[("Images", "*.png *.jpg *.bmp *.jpeg"), ("All Files", "*.*")])
 
 
-# ── Native save-image dialog ──────────────────────────────────────────────────
+# Native save-image dialog 
 
 def _native_save_img(title, default_name, parent=None):
     """Save-file dialog for PNG/BMP. Returns path or ''."""
@@ -145,7 +145,7 @@ def _native_save_img(title, default_name, parent=None):
             initialfile=default_name)
 
 
-# ── Native save-text dialog ───────────────────────────────────────────────────
+# Native save-text dialog
 
 def _native_save_txt(title, default_name, parent=None):
     """Save-file dialog for .txt. Returns path or ''."""
